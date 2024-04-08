@@ -179,10 +179,10 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 		let innerHtml = "";
 		readStream.on("data", err(data => innerHtml += data.toString("utf-8")));
 		readStream.on("end", err(() => {
-			writeStream.write(err(() => {
+			writeStream.end(err(() => {
 				const modifiedInnerHtml = modifier(innerHtml);
-				if(modifiedInnerHtml == undefined || modifiedInnerHtml == innerHtml)
-					return innerHtml;
+				if(modifiedInnerHtml == undefined || modifiedInnerHtml == "" || modifiedInnerHtml == innerHtml)
+					return undefined;
 				return modifiedInnerHtml;
 			}, () => innerHtml)());
 		}));
@@ -324,14 +324,14 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 	return (req, res) => {
 		for(let i = requestModifiersStack.length - 1; i >= 0; i--) {
 			const requestModifiers = requestModifiersStack[i];
-			const skipDecoding = i != responseModifiersStack.length - 1;
-			const skipEncoding = i != 0;
+			const skipDecoding = i != 0;
+			const skipEncoding = i != responseModifiersStack.length - 1;
 			trumpetStreamModifier(req, requestModifiers, { skipDecoding, skipEncoding });
 		}
 		for(let i = responseModifiersStack.length - 1; i >= 0; i--) {
 			const responseModifiers = responseModifiersStack[i];
-			const skipDecoding = i != responseModifiersStack.length - 1;
-			const skipEncoding = i != 0;
+			const skipDecoding = i != 0;
+			const skipEncoding = i != responseModifiersStack.length - 1;
 			trumpetStreamModifier(res, responseModifiers, { skipDecoding, skipEncoding });
 		}
 	};
