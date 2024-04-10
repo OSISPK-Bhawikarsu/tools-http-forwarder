@@ -7,7 +7,7 @@ import consoleStamp from "console-stamp";
 import httpProxy from "http-proxy";
 import trumpet from "@gofunky/trumpet";
 import zlib from "zlib";
-import EventEmitter from "events";
+import { isUint8Array } from "util/types";
 consoleStamp(console, { format: ":date(mm/dd HH:MM:ss.l) :label" });
 
 const __filename = url.fileURLToPath(import.meta.url);
@@ -44,110 +44,289 @@ class HTTPError extends Error {
 	}
 }
 
-function trumpetStreamModifier(stream, modifiers, { skipDecoding = false, skipEncoding = false } = {}) {
+class ZlibTransformStream extends TransformStream {
+	constructor(stream, flushDelay, flushBytes) {
+		let dataCallback;
+		let errorCallback;
+		let drainCallback;
+		let flushTimeoutHandle;
+		let bytesWritten;
+		let lastFlushBytesWritten;
+		super({
+			start: controller => {
+				stream.on("data", dataCallback = chunk => {
+					// Currently, cancelled streams are not handled in node.js
+					// https://github.com/nodejs/node/issues/49971
+					try { controller.enqueue(chunk); } catch(e) {}
+				});
+				stream.on("error", errorCallback = e => {
+					stream.close();
+					stream.off("data", dataCallback);
+					stream.off("error", errorCallback);
+					if(drainCallback != null)
+						stream.off("drain", drainCallback);
+					controller.error(e);
+				});
+				bytesWritten = 0;
+				lastFlushBytesWritten = 0;
+			},
+			flush: controller => {
+				return new Promise(resolve => {
+					if(flushTimeoutHandle != null)
+						clearTimeout(flushTimeoutHandle);
+					// Set to zero instead of null to disable future flushing
+					flushTimeoutHandle = 0;
+					lastFlushBytesWritten = bytesWritten;
+					stream.flush(() => {
+						stream.close();
+						stream.off("data", dataCallback);
+						stream.off("error", errorCallback);
+						if(drainCallback != null)
+							stream.off("drain", drainCallback);
+						controller.terminate();
+						resolve();
+					});
+				});
+			},
+			transform: chunk => {
+				const needWait = !stream.write(chunk);
+				bytesWritten += chunk.length;
+				if(flushDelay <= 0 || bytesWritten - lastFlushBytesWritten >= flushBytes) {
+					lastFlushBytesWritten = bytesWritten;
+					stream.flush();
+					if(flushTimeoutHandle != null)
+						clearTimeout(flushTimeoutHandle);
+					flushTimeoutHandle = null;
+					if(!needWait) return;
+					return new Promise(r => stream.once("drain", drainCallback = r));
+				}
+				// Don't reschedule flush timeout, since we are accumulating chunks
+				if(flushTimeoutHandle != null || !isFinite(flushDelay)) {
+					if(!needWait) return;
+					return new Promise(r => stream.once("drain", drainCallback = r));
+				}
+				const timeoutHandle = flushTimeoutHandle = setTimeout(() => {
+					lastFlushBytesWritten = bytesWritten;
+					stream.flush(() => {
+						if(flushTimeoutHandle != timeoutHandle) return;
+						flushTimeoutHandle = null;
+					});
+				}, flushDelay);
+				if(!needWait) return;
+				return new Promise(r => stream.once("drain", drainCallback = r));
+			}
+		});
+	}
+}
+class TrumpetTransformStream extends TransformStream {
+	constructor(stream) {
+		let dataCallback;
+		let errorCallback;
+		let drainCallback;
+		let endCallback;
+		super({
+			start: controller => {
+				stream.on("data", dataCallback = chunk => {
+					// Currently, cancelled streams are not handled in node.js
+					// https://github.com/nodejs/node/issues/49971
+					try { controller.enqueue(chunk); } catch(e) {}
+				});
+				stream.on("error", errorCallback = e => {
+					stream.end();
+					stream.off("data", dataCallback);
+					stream.off("error", errorCallback);
+					if(drainCallback != null)
+						stream.off("drain", drainCallback);
+					if(endCallback != null)
+						stream.off("end", endCallback);
+					controller.error(e);
+				});
+			},
+			flush: controller => {
+				return new Promise(resolve => {
+					stream.once("end", endCallback = () => {
+						stream.off("data", dataCallback);
+						stream.off("error", errorCallback);
+						if(drainCallback != null)
+							stream.off("drain", drainCallback);
+						if(endCallback != null)
+							stream.off("end", endCallback);
+						controller.terminate();
+						resolve();
+					});
+					stream.end();
+				});
+			},
+			transform: chunk => {
+				const needWait = !stream.write(chunk);
+				if(!needWait) return;
+				return new Promise(r => stream.once("drain", drainCallback = r));
+			}
+		});
+	}
+}
+
+function tapNodeStream(stream, tapper) {
+	let originalWrite;
+	let originalEnd;
+	let readableCancelled;
+	let readableQueue;
+	let readableUnlock;
+	let readableBackpressure;
+	let cleaned;
+	let cleanup;
+	const readable = tapper(new ReadableStream({
+		type: "bytes",
+		start: controller => {
+			originalWrite = stream.write.bind(stream);
+			originalEnd = stream.end.bind(stream);
+			readableCancelled = false;
+			readableQueue = [];
+			readableUnlock = null;
+			readableBackpressure = () => readableQueue.reduce((p, [b]) => p + (b != null ? b.length : 0), 0) <= 2048;
+			cleaned = false;
+			cleanup = (error) => {
+				if(cleaned) return;
+				cleaned = true;
+				readableCancelled = true;
+				if(readableUnlock != null) {
+					readableUnlock();
+					readableUnlock = null;
+				}
+				if(error == null) controller.close();
+				else controller.error(error);
+			};
+			stream.addListener("close", () => cleanup());
+			stream.addListener("error", e => cleanup(e));
+			stream.write = (data, encoding, callback) => {
+				readableQueue.push([data, encoding, callback]);
+				if(readableUnlock != null) {
+					readableUnlock();
+					readableUnlock = null;
+				}
+				return readableBackpressure();
+			};
+			stream.end = (data, encoding, callback) => {
+				if(typeof data == "function") {
+					callback = data;
+					data = null;
+				}
+				if(data != null || callback != null)
+					readableQueue.push([data, encoding, callback]);
+				readableQueue.push([null, null, () => cleanup()]);
+			};
+		},
+		pull: controller => {
+			if(readableCancelled)
+				return;
+			const entry = readableQueue.shift();
+			if(entry != null) {
+				const [data, encoding, callback] = entry;
+				if(readableBackpressure())
+					stream.emit("drain");
+				if(data != null)
+					controller.enqueue(isUint8Array(data) ? data : Buffer.from(data, encoding));
+				if(callback != null)
+					process.nextTick(callback);
+				return;
+			}
+			return (async () => {
+				let entry;
+				while(!readableCancelled && (entry = readableQueue.shift()) == null)
+					await new Promise(r => readableUnlock = r);
+				if(entry == null) return;
+				const [data, encoding, callback] = entry;
+				if(readableBackpressure())
+					stream.emit("drain");
+				if(data != null)
+					controller.enqueue(isUint8Array(data) ? data : Buffer.from(data, encoding));
+				if(callback != null)
+					process.nextTick(callback);
+			})();
+		},
+		cancel: error => {
+			if(error != null)
+				stream.emit("error", error);
+			cleanup(error);
+		}
+	}));
+	readable.pipeTo(new WritableStream({
+		write: chunk => new Promise(r => originalWrite(chunk, null, r)),
+		close: () => new Promise(r => originalEnd(r)),
+		abort: error => error != null && stream.emit("error", error)
+	}));
+}
+
+function trumpetStreamModifier(stream, modifiersStack) {
 	let headerInspected = false;
 	let isHtml;
 	let contentEncoding;
-	function inspectHeader() {
+	const inspectHeader = () => {
 		if(headerInspected) return;
 		headerInspected = true;
 		const headers = stream.getHeaders();
 		isHtml = (headers["content-type"] || "").toLowerCase().includes("text/html");
 		contentEncoding = (headers["content-encoding"] || "").toLowerCase();
-	}
+	};
 	let streamInitiated = false;
-	let streamWrite;
-	let streamEnd;
-	let trumpetStream;
-	let decodeStream;
-	let encodeStream;
-	function initStream() {
+	const initStream = () => {
 		if(streamInitiated) return;
 		streamInitiated = true;
-		trumpetStream = trumpet();
-		if(skipDecoding) {
-			decodeStream = new EventEmitter();
-			decodeStream.write = (data, encoding) => decodeStream.emit("data", Buffer.from(data, encoding));
-			decodeStream.flush = (cb) => process.nextTick(cb);
-			decodeStream.close = () => decodeStream.emit("close");
-		}
-		if(skipEncoding) {
-			encodeStream = new EventEmitter();
-			encodeStream.write = (data, encoding) => encodeStream.emit("data", Buffer.from(data, encoding));
-			encodeStream.flush = (cb) => process.nextTick(cb);
-			encodeStream.close = () => encodeStream.emit("close");
-		}
-		if(contentEncoding == "br") {
-			if(decodeStream == null)
-				decodeStream = zlib.createBrotliDecompress();
-			if(encodeStream == null)
-				encodeStream = zlib.createBrotliCompress();
-		} else if(contentEncoding == "gzip") {
-			if(decodeStream == null)
-				decodeStream = zlib.createGunzip();
-			if(encodeStream == null)
-				encodeStream = zlib.createGzip();
-		} else if(contentEncoding == "deflate") {
-			if(decodeStream == null)
-				decodeStream = zlib.createInflate();
-			if(encodeStream == null)
-				encodeStream = zlib.createDeflate();
-		} else {
-			if(decodeStream == null) {
-				decodeStream = new EventEmitter();
-				decodeStream.write = (data, encoding) => decodeStream.emit("data", Buffer.from(data, encoding));
-				decodeStream.flush = (cb) => process.nextTick(cb);
-				decodeStream.close = () => decodeStream.emit("close");
+		tapNodeStream(stream, readable => {
+			if(contentEncoding == "br")
+				readable = readable.pipeThrough(new ZlibTransformStream(zlib.createBrotliDecompress(), -1, 0));
+			if(contentEncoding == "gzip")
+				readable = readable.pipeThrough(new ZlibTransformStream(zlib.createGunzip(), -1, 0));
+			if(contentEncoding == "deflate")
+				readable = readable.pipeThrough(new ZlibTransformStream(zlib.createInflate(), -1, 0));
+			for(const modifiers of modifiersStack) {
+				const trumpetStream = trumpet();
+				for(const modifier of modifiers)
+					trumpetStream.selectAll(modifier.query, modifier.func);
+				readable = readable.pipeThrough(new TrumpetTransformStream(trumpetStream));
 			}
-			if(encodeStream == null) {
-				encodeStream = new EventEmitter();
-				encodeStream.write = (data, encoding) => encodeStream.emit("data", Buffer.from(data, encoding));
-				encodeStream.flush = (cb) => process.nextTick(cb);
-				encodeStream.close = () => encodeStream.emit("close");
-			}
-		}
-		for(const modifier of modifiers)
-			trumpetStream.selectAll(modifier.query, modifier.func);
-		decodeStream.on("data", data => trumpetStream.write(data));
-		decodeStream.on("close", () => trumpetStream.end());
-		trumpetStream.on("data", data => encodeStream.write(data));
-		trumpetStream.on("end", () => encodeStream.flush(() => encodeStream.close()));
-		encodeStream.on("data", data => streamWrite(data));
-		encodeStream.on("close", () => streamEnd());
-	}
+			if(contentEncoding == "br")
+				readable = readable.pipeThrough(new ZlibTransformStream(zlib.createBrotliCompress(), 500, 65536));
+			if(contentEncoding == "gzip")
+				readable = readable.pipeThrough(new ZlibTransformStream(zlib.createGzip(), 500, 65536));
+			if(contentEncoding == "deflate")
+				readable = readable.pipeThrough(new ZlibTransformStream(zlib.createDeflate(), 500, 65536));
+			return readable;
+		});
+	};
 	if(stream.flushHeaders != null) {
-		const originalSetHeader = stream.setHeader.bind(stream);
 		const originalFlushHeaders = stream.flushHeaders.bind(stream);
-		const originalWrite = streamWrite = stream.write.bind(stream);
-		const originalEnd = streamEnd = stream.end.bind(stream);
-		stream.setHeader = (name, value) => {
-			originalSetHeader(name, value);
-			inspectHeader();
-			headerInspected = false;
-			if(isHtml)
+		const originalWrite = stream.write.bind(stream);
+		const originalEnd = stream.end.bind(stream);
+		let tapPrepared = false;
+		const prepareTap = () => {
+			if(tapPrepared) return;
+			tapPrepared = true;
+			stream.flushHeaders = originalFlushHeaders;
+			stream.write = originalWrite;
+			stream.end = originalEnd;
+			if(isHtml) {
 				stream.removeHeader("content-length");
+				initStream();
+			}
 		};
 		stream.flushHeaders = () => {
 			inspectHeader();
-			if(isHtml)
-				stream.removeHeader("content-length");
-			originalFlushHeaders();
+			prepareTap();
+			// stream.flushHeaders is different after tapping
+			stream.flushHeaders();
 		};
-		stream.write = (data, encoding) => {
+		stream.write = (data, encoding, callback) => {
 			inspectHeader();
-			if(!isHtml)
-				return originalWrite(data, encoding);
-			initStream();
-			return decodeStream.write(Buffer.from(data, encoding));
+			prepareTap();
+			// stream.write is different after tapping
+			stream.write(data, encoding, callback);
 		};
-		stream.end = (data, encoding) => {
+		stream.end = (data, encoding, callback) => {
 			inspectHeader();
-			if(!isHtml)
-				return originalEnd(data, encoding);
-			initStream();
-			if(data != null)
-				decodeStream.write(Buffer.from(data, encoding));
-			decodeStream.flush(() => decodeStream.close());
+			prepareTap();
+			// stream.end is different after tapping
+			stream.end(data, encoding, callback);
 		};
 	} else {
 		// TODO
@@ -322,18 +501,8 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 	}
 
 	return (req, res) => {
-		for(let i = requestModifiersStack.length - 1; i >= 0; i--) {
-			const requestModifiers = requestModifiersStack[i];
-			const skipDecoding = i != 0;
-			const skipEncoding = i != responseModifiersStack.length - 1;
-			trumpetStreamModifier(req, requestModifiers, { skipDecoding, skipEncoding });
-		}
-		for(let i = responseModifiersStack.length - 1; i >= 0; i--) {
-			const responseModifiers = responseModifiersStack[i];
-			const skipDecoding = i != 0;
-			const skipEncoding = i != responseModifiersStack.length - 1;
-			trumpetStreamModifier(res, responseModifiers, { skipDecoding, skipEncoding });
-		}
+		trumpetStreamModifier(req, requestModifiersStack);
+		trumpetStreamModifier(res, responseModifiersStack);
 	};
 }
 
