@@ -1,3 +1,4 @@
+
 import url from "url";
 import path from "path";
 import http from "http";
@@ -214,6 +215,10 @@ function tapNodeStream(stream, tapper) {
 				if(data != null || callback != null)
 					readableQueue.push([data, encoding, callback]);
 				readableQueue.push([null, null, () => cleanup()]);
+				if(readableUnlock != null) {
+					readableUnlock();
+					readableUnlock = null;
+				}
 			};
 		},
 		pull: controller => {
