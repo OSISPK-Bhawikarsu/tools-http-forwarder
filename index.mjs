@@ -365,7 +365,7 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 		readStream.on("end", err(() => {
 			writeStream.end(err(() => {
 				const modifiedInnerHtml = modifier(innerHtml);
-				if(modifiedInnerHtml == undefined || modifiedInnerHtml == "" || modifiedInnerHtml == innerHtml)
+				if(modifiedInnerHtml == undefined || modifiedInnerHtml == "")
 					return undefined;
 				return modifiedInnerHtml;
 			}, () => innerHtml)());
@@ -448,12 +448,20 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 			const hosts = (modifier.host instanceof Array ? modifier.host : [modifier.host])
 				.filter(h => typeof h == "string");
 			const modifierFn = err(content => {
-				const regex = /(?:(?:[-a-zA-Z0-9+.]+:\/\/)|(?:www\.))[-a-zA-Z0-9@:%._\+~#=]{1,256}\.?[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)/gm;
-				const modifiedContent = regexReplace(regex, content, err(matcher => {
+				let regex, modifiedContent;
+				regex = /(?:(?:[-a-zA-Z0-9+.]+:\/\/)|(?:www\.))[-a-zA-Z0-9@:%._\+~#=]{1,256}\.?[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)/gm;
+				modifiedContent = regexReplace(regex, content, err(matcher => {
 					const url = new URL(matcher[0], "http://n");
 					if(!hosts.includes(url.host) || url.protocol == requestProtocol) return matcher[0];
 					url.protocol = requestProtocol;
 					return url.href;
+				}), (_, m) => m[0]);
+				regex = /(?:(["'`])(?:[-a-zA-Z0-9+.]+:\\?\/\\?\/)|(?:www\.))[-a-zA-Z0-9@:%._\+~#=]{1,256}\.?[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\\\/=]*\1)/gm;
+				modifiedContent = regexReplace(regex, content, err(matcher => {
+					const url = new URL(JSON.parse(matcher[0].replaceAll("'", "\"")), "http://n");
+					if(!hosts.includes(url.host) || url.protocol == requestProtocol) return matcher[0];
+					url.protocol = requestProtocol;
+					return JSON.stringify(url.href);
 				}), (_, m) => m[0]);
 				return modifiedContent;
 			});
@@ -474,14 +482,29 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 			const rewrites = (modifier.rewrite instanceof Array ? modifier.rewrite : [modifier.rewrite])
 				.filter(r => r.from != null && r.to != null);
 			const modifierFn = err(content => {
-				const regex = /(?:(?:[-a-zA-Z0-9+.]+:\/\/)|(?:www\.))[-a-zA-Z0-9@:%._\+~#=]{1,256}\.?[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)/gm;
-				const modifiedContent = regexReplace(regex, content, err(matcher => {
+				let regex, modifiedContent;
+				regex = /(?:(?:[-a-zA-Z0-9+.]+:\/\/)|(?:www\.))[-a-zA-Z0-9@:%._\+~#=]{1,256}\.?[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\/=]*)/gm;
+				modifiedContent = regexReplace(regex, content, err(matcher => {
 					for(const rewrite of rewrites) {
 						try {
 							const url = new URL(matcher[0], "http://n");
 							if(rewrite.from != url.host) continue;
 							url.host = rewrite.to;
 							return url.href;
+						} catch(_) {
+							continue;
+						}
+					}
+					return matcher[0];
+				}), (_, m) => m[0]);
+				regex = /(?:(["'`])(?:[-a-zA-Z0-9+.]+:\\?\/\\?\/)|(?:www\.))[-a-zA-Z0-9@:%._\+~#=]{1,256}\.?[a-zA-Z0-9()]{1,6}\b(?:[-a-zA-Z0-9()@:%_\+.~#?&\\\/=]*\1)/gm;
+				modifiedContent = regexReplace(regex, content, err(matcher => {
+					for(const rewrite of rewrites) {
+						try {
+							const url = new URL(JSON.parse(matcher[0].replaceAll("'", "\"")), "http://n");
+							if(rewrite.from != url.host) continue;
+							url.host = rewrite.to;
+							return JSON.stringify(url.href);
 						} catch(_) {
 							continue;
 						}
@@ -554,7 +577,13 @@ async function proxyRequest(req, res, upgradeHead, reqBody) {
 		xfwd: true,
 		ws: true,
 		followRedirects: false,
-		agent: agent
+		agent: agent,
+		headers: {
+			"host": targetHostname,
+			"x-real-ip": requestIp,
+			"x-forwarded-for": requestIp,
+			"x-forwarded-proto": requestProtocol,
+		}
 	});
 	proxy.on("proxyReq", (r) => {
 		r.setHeader("host", targetHostname);
