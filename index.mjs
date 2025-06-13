@@ -547,7 +547,7 @@ async function proxyRequest(req, res, upgradeHead, reqBody) {
 	let trumpetModifiers = null;
 	if(req.headers["x-trumpet-modifiers"]) {
 		try {
-			modifiers = getTrumpetModifiers(JSON.parse(req.headers["x-trumpet-modifiers"]), { requestProtocol });
+			trumpetModifiers = getTrumpetModifiers(JSON.parse(req.headers["x-trumpet-modifiers"]), { requestProtocol });
 		} catch(e) {
 			throw new HTTPError(400, `Invalid trumpet modifiers, ${e.message}`);
 		}
@@ -613,7 +613,7 @@ async function proxyRequest(req, res, upgradeHead, reqBody) {
 			res.removeListener("error", cleanup);
 			res.removeListener("close", cleanup);
 			proxyRes.destroy(err);
-			res.destroy(err);
+			req.destroy(err);
 		};
 		proxyRes.addListener("error", cleanup);
 		proxyRes.addListener("close", cleanup);
