@@ -558,7 +558,7 @@ async function proxyRequest(req, res, upgradeHead, reqBody) {
 	const promiseResolvers = Promise.withResolvers();
 	const proxy = httpProxy.createProxy({
 		agent: targetProto == "https" ? proxyHttpsAgent : proxyHttpAgent,
-		target: `${targetProto}://${targetHost}:${targetPort}`,
+		target: `${targetProto}://${targetHost}:${targetPort}${!!req.headers["x-connect-uri"] ? req.headers["x-connect-uri"] : ""}`,
 		ws: true,
 		xfwd: true,
 		changeOrigin: false,
