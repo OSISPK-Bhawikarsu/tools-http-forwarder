@@ -3,7 +3,8 @@ import url from "url";
 import path from "path";
 import http from "http";
 import https from "https";
-import express from "express";
+import cluster from "cluster";
+import os from "os";
 import consoleStamp from "console-stamp";
 import httpProxy from "http-proxy";
 import trumpet from "@gofunky/trumpet";
@@ -13,6 +14,15 @@ consoleStamp(console, { format: ":date(mm/dd HH:MM:ss.l) :label" });
 
 const __filename = url.fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const PORT = process.env.PORT;
+const proxyHttpAgent = new http.Agent({
+	keepAlive: true,
+	keepAliveMsecs: 30 * 1000
+});
+const proxyHttpsAgent = new https.Agent({
+	keepAlive: true,
+	keepAliveMsecs: 30 * 1000
+});
 
 function regexReplace(regex, string, replacer) {
 	let lastIndex = 0;
@@ -27,16 +37,6 @@ function regexReplace(regex, string, replacer) {
 	result += string.slice(lastIndex);
 	return result;
 }
-
-const proxyHttpAgent = new http.Agent({
-	keepAlive: true,
-	keepAliveMsecs: 30 * 1000
-});
-const proxyHttpsAgent = new https.Agent({
-	keepAlive: true,
-	keepAliveMsecs: 30 * 1000
-});
-
 class HTTPError extends Error {
 	constructor(code, message) {
 		super(message);
@@ -44,7 +44,6 @@ class HTTPError extends Error {
 		this.stack = "";
 	}
 }
-
 class ZlibTransformStream extends TransformStream {
 	constructor(stream, flushDelay, flushBytes) {
 		let dataCallback;
@@ -527,147 +526,120 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 			});
 		}
 	}
-
 	return (req, res) => {
 		trumpetStreamModifier(req, requestModifiersStack);
 		trumpetStreamModifier(res, responseModifiersStack);
 	};
 }
 
-function isValidHttpUrl(string, protocols) {
-	try {
-		const url = new URL(string);
-		if(protocols != null)
-			return protocols.map(x => `${x.toLowerCase()}:`).includes(url.protocol);
-		return true;
-	} catch(_) {
-		return false;
-	}
-}
 async function proxyRequest(req, res, upgradeHead, reqBody) {
-	const requestIp = (req.headers["x-forwarded-for"] || req.socket.remoteAddress).split(",").map(l => l.trim()).at(-1);
-	const requestProtocol = (req.headers["x-forwarded-proto"] || req.protocol).split(",").map(l => l.trim()).at(-1);
-	const token = req.headers["x-connect-token"];
-	if(token != process.env.HTTP_FORWARDER_CONNECT_TOKEN)
+	if(req.headers["x-connect-token"] != process.env.HTTP_FORWARDER_CONNECT_TOKEN)
 		throw new HTTPError(400, "Bad token");
+	const requestProtocol = (req.headers["x-forwarded-proto"] || req.protocol).split(",").map(l => l.trim()).at(-1);
+	const requestIp = (req.headers["x-forwarded-for"] || req.socket.remoteAddress).split(",").map(l => l.trim()).at(-1);
+	const targetProto = req.headers["x-connect-proto"] || "http";
 	const targetHost = req.headers["x-connect-host"];
 	const targetPort = req.headers["x-connect-port"];
 	const targetHostname = req.headers["x-connect-hostname"] || targetHost;
-	const targetProto = req.headers["x-connect-proto"] || "http";
-	const targetUri = req.headers["x-connect-uri"] || "/";
-	const targetUrl = `${targetProto}://${targetHost}:${targetPort}${targetUri}`;
-	if(!isValidHttpUrl(targetUrl, ["https", "http"]))
+	const targetUri = req.headers["x-connect-uri"] || req.uri || "/";
+	if(!["https", "http"].includes(targetProto))
 		throw new HTTPError(400, "Invalid connect headers.");
-	const trumpetModifiers = (() => { 
-		if(!req.headers["x-trumpet-modifiers"]) return null;
-		let modifiers;
+	let trumpetModifiers = null;
+	if(req.headers["x-trumpet-modifiers"]) {
 		try {
-			modifiers = JSON.parse(req.headers["x-trumpet-modifiers"]);
+			modifiers = getTrumpetModifiers(JSON.parse(req.headers["x-trumpet-modifiers"]), { requestProtocol });
 		} catch(e) {
 			throw new HTTPError(400, `Invalid trumpet modifiers, ${e.message}`);
 		}
-		return getTrumpetModifiers(modifiers, { requestProtocol });
-	})();
-	console.log(`[REQUEST]: ${requestIp}: (${requestProtocol}) ${targetUrl}`);
-	const agent = targetProto == "https" ? proxyHttpsAgent : proxyHttpAgent;
-	const proxy = httpProxy.createProxy({
-		target: targetUrl,
-		changeOrigin: false,
-		ignorePath: true,
-		xfwd: true,
-		ws: true,
-		followRedirects: false,
-		agent: agent,
-		headers: {
-			"host": targetHostname,
-			"x-real-ip": requestIp,
-			"x-forwarded-for": requestIp,
-			"x-forwarded-proto": requestProtocol,
-		}
-	});
-	proxy.on("proxyReq", (r) => {
-		r.setHeader("host", targetHostname);
-		r.setHeader("x-real-ip", requestIp);
-		r.setHeader("x-forwarded-for", requestIp);
-		r.setHeader("x-forwarded-proto", requestProtocol);
-		r.removeHeader("x-connect-token");
-		r.removeHeader("x-connect-host");
-		r.removeHeader("x-connect-port");
-		r.removeHeader("x-connect-hostname");
-		r.removeHeader("x-connect-proto");
-		r.removeHeader("x-connect-uri");
-		r.removeHeader("x-trumpet-modifiers");
-		r.removeHeader("x-forwarded-host");
-		r.removeHeader("cdn-loop");
-		r.removeHeader("cf-connecting-ip");
-		r.removeHeader("cf-ipcountry");
-		r.removeHeader("cf-ray");
-		r.removeHeader("cf-visitor");
-		r.removeHeader("cf-warp-tag-id");
-	});
+	}
 	if(trumpetModifiers != null)
 		trumpetModifiers(req, res);
-	await new Promise((proxyResolve, proxyReject) => {
-		let finished = false;
-		proxy.on("proxyReq", (proxyReq) => {
-			res.on("close", () => proxyReq.destroy());
-		});
-		proxy.on("proxyRes", (proxyRes) => {
-			if(res.destroyed) proxyRes.destroy();
-			else res.on("close", () => proxyRes.destroy());
-		});
-		proxy.on("proxyRes", (proxyRes, innerReq, innerRes) => {
-			const cleanup = (err) => {
-				proxyRes.removeListener("error", cleanup);
-				proxyRes.removeListener("close", cleanup);
-				innerRes.removeListener("error", cleanup);
-				innerRes.removeListener("close", cleanup);
-				innerReq.destroy(err);
-				proxyRes.destroy(err);
-			}
-			proxyRes.once("error", cleanup);
-			proxyRes.once("close", cleanup);
-			innerRes.once("error", cleanup);
-			innerRes.once("close", cleanup);
-		});
-		proxy.on("error", (err) => {
-			console.error(`[REQUEST]: ${requestIp}: (${requestProtocol}) Failed to proxy ${targetUrl}`, err.message);
-			if(finished) return;
-			finished = true;
-			const message = err.message;
-			if(message.includes("ECONNRESET") || message.includes("ECONNABORTED") || message.includes("ECONNREFUSED")) {
-				proxyReject(new HTTPError(504, "Gateway Timed Out"));
-				return;
-			}
-			if(message.includes("Parse Error")) {
-				proxyReject(new HTTPError(502, "Bad Gateway"));
-				return;
-			}
-			proxyReject(new HTTPError(500, "Internal Server Error"));
-		});
-		if(upgradeHead) {
-			proxy.on("proxyReqWs", (proxyReq) => {
-				proxyReq.on("close", () => {
-					if(finished) return;
-					finished = true;
-					proxyResolve(true);
-				});
-			});
-			proxy.ws(req, res, upgradeHead)
-			proxyResolve(true);
-		} else {
-			proxy.on("proxyReq", (proxyReq) => {
-				proxyReq.on("close", () => {
-					if(finished) return;
-					finished = true;
-					proxyResolve(true);
-				});
-			});
-			proxy.web(req, res, {
-				buffer: reqBody
-			});
-		}
+	console.log(`[REQUEST]: ${requestIp}: (${requestProtocol}) ${targetProto}://${targetHostname}:${targetPort}${targetUri}`);
+	const promiseResolvers = Promise.withResolvers();
+	const proxy = httpProxy.createProxy({
+		agent: targetProto == "https" ? proxyHttpsAgent : proxyHttpAgent,
+		target: `${targetProto}://${targetHost}:${targetPort}`,
+		ws: true,
+		xfwd: true,
+		changeOrigin: false,
+		ignorePath: !!req.headers["x-connect-uri"],
+		followRedirects: false
 	});
+	proxy.on("proxyReq", proxyReq => {
+		if(res.destroyed) {
+			proxyReq.destroy();
+			res.destroy();
+			return;
+		}
+		const cleanup = (err) => {
+			res.removeListener("error", cleanup);
+			res.removeListener("close", cleanup);
+			proxyReq.destroy(err);
+			res.destroy(err);
+		};
+		res.addListener("error", cleanup);
+		res.addListener("close", cleanup);
+		proxyReq.setHeader("host", targetHostname);
+		proxyReq.setHeader("x-real-ip", requestIp);
+		proxyReq.setHeader("x-forwarded-for", requestIp);
+		proxyReq.setHeader("x-forwarded-proto", requestProtocol);
+		proxyReq.removeHeader("x-connect-token");
+		proxyReq.removeHeader("x-connect-host");
+		proxyReq.removeHeader("x-connect-port");
+		proxyReq.removeHeader("x-connect-hostname");
+		proxyReq.removeHeader("x-connect-proto");
+		proxyReq.removeHeader("x-trumpet-modifiers");
+		proxyReq.removeHeader("x-forwarded-host");
+		proxyReq.removeHeader("cdn-loop");
+		proxyReq.removeHeader("cf-connecting-ip");
+		proxyReq.removeHeader("cf-ipcountry");
+		proxyReq.removeHeader("cf-ray");
+		proxyReq.removeHeader("cf-visitor");
+		proxyReq.removeHeader("cf-warp-tag-id");
+		proxyReq.once("close", () => promiseResolvers.resolve(true));
+	});
+	proxy.on("proxyReqWs", proxyReq => {
+		proxyReq.once("close", () => promiseResolvers.resolve(true));
+	});
+	proxy.on("proxyRes", proxyRes => {
+		if(proxyRes.destroyed || res.destroyed) {
+			proxyRes.destroy();
+			res.destroy();
+			return;
+		}
+		const cleanup = (err) => {
+			proxyRes.removeListener("error", cleanup);
+			proxyRes.removeListener("close", cleanup);
+			res.removeListener("error", cleanup);
+			res.removeListener("close", cleanup);
+			proxyRes.destroy(err);
+			res.destroy(err);
+		};
+		proxyRes.addListener("error", cleanup);
+		proxyRes.addListener("close", cleanup);
+		res.addListener("error", cleanup);
+		res.addListener("close", cleanup);
+	});
+	proxy.on("error", err => {
+		console.error(`[REQUEST]: ${requestIp}: (${requestProtocol}) Failed to proxy ${targetProto}://${targetHostname}:${targetPort}${targetUri}`, err.message);
+		if(err.code == "ETIMEDOUT" || err.message.includes("timeout")) {
+			promiseResolvers.reject(new HTTPError(504, "Gateway Timed Out"));
+			return;
+		}
+		if(["ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", 
+			"ECONNRESET", "ECONNABORTED", "ENOTFOUND", "EPIPE", 
+			"ERR_HTTP_INVALID_HEADER", "HPE_INVALID_HEADER_TOKEN"].includes(err.code) || 
+			err.message.includes("Parse Error") || err.message.includes("socket hang up")) {
+			promiseResolvers.reject(new HTTPError(502, "Bad Gateway"));
+			return;
+		}
+		promiseResolvers.reject(new HTTPError(500, "Internal Server Error"));
+	});
+	if(upgradeHead)
+		proxy.proxyWebsocketRequest(req, res, upgradeHead);
+	else
+		proxy.proxyRequest(req, res, { buffer: reqBody });
+	return await promiseResolvers.promise;
 }
 
 const throwResponseErrorIfPossible = (status, message, res) => {
@@ -679,28 +651,31 @@ const throwResponseErrorIfPossible = (status, message, res) => {
 	}
 	res.statusCode = status;
 	res.end(message);
-}
+};
 const throwSocketErrorIfPossible = (status, message, socket) => {
 	if(socket.destroyed)
 		return;
 	socket.destroy();
-}
+};
 
-const app = express();
-app.use((req, res) => {
-	proxyRequest(req, res).catch(e => {
-		if(e instanceof HTTPError) {
-			throwResponseErrorIfPossible(e.httpCode, e.message, res);
-			return;
-		}
-		throwResponseErrorIfPossible(500, "Internal Server Error", res);
-		throw e;
+if(cluster.isPrimary) {
+	for(let i = 0; i < os.availableParallelism(); i++)
+		cluster.fork();
+	cluster.on("exit", (worker, code, signal) => {
+		console.warn(`Worker ${worker.process.pid} died with code ${code}${signal != null ? ` ${signal}` : ""}`);
+		setTimeout(() => cluster.fork(), 1000 * 15);
 	});
-});
-
-if(!!process.env.PORT) {
-	const PORT = process.env.PORT;
-	const httpServer = http.createServer(app);
+} else {
+	const httpServer = http.createServer((req, res) => {
+		proxyRequest(req, res).catch(e => {
+			if(e instanceof HTTPError) {
+				throwResponseErrorIfPossible(e.httpCode, e.message, res);
+				return;
+			}
+			throwResponseErrorIfPossible(500, "Internal Server Error", res);
+			throw e;
+		});
+	});
 	httpServer.listen(PORT, () => {
 		console.log(`HTTP Server listening to 0.0.0.0:${PORT}`);
 	});
