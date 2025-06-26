@@ -1,4 +1,3 @@
-
 import url from "url";
 import path from "path";
 import http from "http";
@@ -6,22 +5,24 @@ import https from "https";
 import cluster from "cluster";
 import os from "os";
 import consoleStamp from "console-stamp";
-import httpProxy from "http-proxy";
+import http2Proxy from "http2-proxy";
 import trumpet from "@gofunky/trumpet";
 import zlib from "zlib";
 import { isUint8Array } from "util/types";
-consoleStamp(console, { format: ":date(mm/dd HH:MM:ss.l) :label" });
+consoleStamp(console, { format: `:date(mm/dd HH:MM:ss.l) [${process.pid}] :label` });
 
 const __filename = url.fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PORT = process.env.PORT;
 const proxyHttpAgent = new http.Agent({
 	keepAlive: true,
-	keepAliveMsecs: 30 * 1000
+	keepAliveMsecs: 30 * 1000,
+	noDelay: true
 });
 const proxyHttpsAgent = new https.Agent({
 	keepAlive: true,
-	keepAliveMsecs: 30 * 1000
+	keepAliveMsecs: 30 * 1000,
+	noDelay: true
 });
 
 function regexReplace(regex, string, replacer) {
@@ -47,6 +48,7 @@ class HTTPError extends Error {
 class ZlibTransformStream extends TransformStream {
 	constructor(stream, flushDelay, flushBytes) {
 		let dataCallback;
+		let endCallback;
 		let errorCallback;
 		let drainCallback;
 		let flushTimeoutHandle;
@@ -55,13 +57,20 @@ class ZlibTransformStream extends TransformStream {
 		super({
 			start: controller => {
 				stream.on("data", dataCallback = chunk => {
-					// Currently, cancelled streams are not handled in node.js
-					// https://github.com/nodejs/node/issues/49971
-					try { controller.enqueue(chunk); } catch(e) {}
+					controller.enqueue(chunk);
+				});
+				stream.on("end", endCallback = () => {
+					stream.off("data", dataCallback);
+					stream.off("end", endCallback);
+					stream.off("error", errorCallback);
+					if(drainCallback != null)
+						stream.off("drain", drainCallback);
+					controller.terminate();
 				});
 				stream.on("error", errorCallback = e => {
 					stream.close();
 					stream.off("data", dataCallback);
+					stream.off("end", endCallback);
 					stream.off("error", errorCallback);
 					if(drainCallback != null)
 						stream.off("drain", drainCallback);
@@ -70,26 +79,19 @@ class ZlibTransformStream extends TransformStream {
 				bytesWritten = 0;
 				lastFlushBytesWritten = 0;
 			},
-			flush: controller => {
+			flush: () => {
 				return new Promise(resolve => {
 					if(flushTimeoutHandle != null)
 						clearTimeout(flushTimeoutHandle);
 					// Set to zero instead of null to disable future flushing
 					flushTimeoutHandle = 0;
 					lastFlushBytesWritten = bytesWritten;
-					stream.flush(() => {
-						stream.close();
-						stream.off("data", dataCallback);
-						stream.off("error", errorCallback);
-						if(drainCallback != null)
-							stream.off("drain", drainCallback);
-						controller.terminate();
-						resolve();
-					});
+					stream.once("end", () => resolve());
+					stream.end();
 				});
 			},
 			transform: chunk => {
-				const needWait = !stream.write(chunk);
+				const dontNeedDrain = stream.write(chunk);
 				bytesWritten += chunk.length;
 				if(flushDelay <= 0 || bytesWritten - lastFlushBytesWritten >= flushBytes) {
 					lastFlushBytesWritten = bytesWritten;
@@ -97,12 +99,12 @@ class ZlibTransformStream extends TransformStream {
 					if(flushTimeoutHandle != null)
 						clearTimeout(flushTimeoutHandle);
 					flushTimeoutHandle = null;
-					if(!needWait) return;
+					if(dontNeedDrain) return;
 					return new Promise(r => stream.once("drain", drainCallback = r));
 				}
 				// Don't reschedule flush timeout, since we are accumulating chunks
 				if(flushTimeoutHandle != null || !isFinite(flushDelay)) {
-					if(!needWait) return;
+					if(dontNeedDrain) return;
 					return new Promise(r => stream.once("drain", drainCallback = r));
 				}
 				const timeoutHandle = flushTimeoutHandle = setTimeout(() => {
@@ -112,7 +114,7 @@ class ZlibTransformStream extends TransformStream {
 						flushTimeoutHandle = null;
 					});
 				}, flushDelay);
-				if(!needWait) return;
+				if(dontNeedDrain) return;
 				return new Promise(r => stream.once("drain", drainCallback = r));
 			}
 		});
@@ -121,45 +123,41 @@ class ZlibTransformStream extends TransformStream {
 class TrumpetTransformStream extends TransformStream {
 	constructor(stream) {
 		let dataCallback;
+		let endCallback;
 		let errorCallback;
 		let drainCallback;
-		let endCallback;
 		super({
 			start: controller => {
 				stream.on("data", dataCallback = chunk => {
-					// Currently, cancelled streams are not handled in node.js
-					// https://github.com/nodejs/node/issues/49971
-					try { controller.enqueue(chunk); } catch(e) {}
+					controller.enqueue(chunk);
+				});
+				stream.on("end", endCallback = () => {
+					stream.off("data", dataCallback);
+					stream.off("end", endCallback);
+					stream.off("error", errorCallback);
+					if(drainCallback != null)
+						stream.off("drain", drainCallback);
+					controller.terminate();
 				});
 				stream.on("error", errorCallback = e => {
 					stream.end();
 					stream.off("data", dataCallback);
+					stream.off("end", endCallback);
 					stream.off("error", errorCallback);
 					if(drainCallback != null)
 						stream.off("drain", drainCallback);
-					if(endCallback != null)
-						stream.off("end", endCallback);
 					controller.error(e);
 				});
 			},
-			flush: controller => {
+			flush: () => {
 				return new Promise(resolve => {
-					stream.once("end", endCallback = () => {
-						stream.off("data", dataCallback);
-						stream.off("error", errorCallback);
-						if(drainCallback != null)
-							stream.off("drain", drainCallback);
-						if(endCallback != null)
-							stream.off("end", endCallback);
-						controller.terminate();
-						resolve();
-					});
+					stream.once("end", () => resolve());
 					stream.end();
 				});
 			},
 			transform: chunk => {
-				const needWait = !stream.write(chunk);
-				if(!needWait) return;
+				const dontNeedDrain = stream.write(chunk);
+				if(dontNeedDrain) return;
 				return new Promise(r => stream.once("drain", drainCallback = r));
 			}
 		});
@@ -338,13 +336,12 @@ function trumpetStreamModifier(stream, modifiersStack) {
 	}
 }
 function getTrumpetModifiers(modifiers, { requestProtocol }) {
-	const requestModifiersStack = [];
-	const responseModifiersStack = [];
+	let requestModifiersStack = [];
+	let responseModifiersStack = [];
 	let requestModifiers;
 	let responseModifiers;
 	requestModifiersStack.push(requestModifiers = []);
 	responseModifiersStack.push(responseModifiers = []);
-	requestProtocol = `${requestProtocol}:`;
 
 	const err = (cb, err = () => null) => (...args) => { try { return cb(...args) } catch(e) { return err(e, ...args); } };
 	const rewriteElementProperty = (node, propertyName, modifier) => {
@@ -526,120 +523,96 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 			});
 		}
 	}
+	requestModifiersStack = requestModifiersStack.filter(s => s.length > 0);
+	responseModifiersStack = responseModifiersStack.filter(s => s.length > 0);
 	return (req, res) => {
-		trumpetStreamModifier(req, requestModifiersStack);
-		trumpetStreamModifier(res, responseModifiersStack);
+		if(requestModifiersStack.length > 0)
+			trumpetStreamModifier(req, requestModifiersStack);
+		if(responseModifiersStack.length > 0)
+			trumpetStreamModifier(res, responseModifiersStack);
 	};
 }
 
-async function proxyRequest(req, res, upgradeHead, reqBody) {
+const normalizeProtocol = protocol => protocol.endsWith(":") ? protocol : `${protocol}:`;
+async function proxyRequest(req, res, upgradeHead) {
 	if(req.headers["x-connect-token"] != process.env.HTTP_FORWARDER_CONNECT_TOKEN)
 		throw new HTTPError(400, "Bad token");
-	const requestProtocol = (req.headers["x-forwarded-proto"] || req.protocol).split(",").map(l => l.trim()).at(-1);
+	const requestProtocol = normalizeProtocol((req.headers["x-forwarded-proto"] || req.protocol).split(",").map(l => l.trim()).at(-1));
 	const requestIp = (req.headers["x-forwarded-for"] || req.socket.remoteAddress).split(",").map(l => l.trim()).at(-1);
-	const targetProto = req.headers["x-connect-proto"] || "http";
+	const targetProto = normalizeProtocol(req.headers["x-connect-proto"] || "http:");
 	const targetHost = req.headers["x-connect-host"];
 	const targetPort = req.headers["x-connect-port"];
 	const targetHostname = req.headers["x-connect-hostname"] || targetHost;
 	const targetUri = req.headers["x-connect-uri"] || req.uri || "/";
-	if(!["https", "http"].includes(targetProto))
+	if(!["https:", "http:"].includes(targetProto))
 		throw new HTTPError(400, "Invalid connect headers.");
 	let trumpetModifiers = null;
 	if(req.headers["x-trumpet-modifiers"]) {
 		try {
-			trumpetModifiers = getTrumpetModifiers(JSON.parse(req.headers["x-trumpet-modifiers"]), { requestProtocol });
+			const trumpetModifiersConfig = JSON.parse(req.headers["x-trumpet-modifiers"]);
+			if(trumpetModifiersConfig.length > 0)
+				trumpetModifiers = getTrumpetModifiers(trumpetModifiersConfig, { requestProtocol });
 		} catch(e) {
 			throw new HTTPError(400, `Invalid trumpet modifiers, ${e.message}`);
 		}
 	}
 	if(trumpetModifiers != null)
 		trumpetModifiers(req, res);
-	console.log(`[REQUEST]: ${requestIp}: (${requestProtocol}) ${targetProto}://${targetHostname}:${targetPort}${targetUri}`);
-	const promiseResolvers = Promise.withResolvers();
-	const proxy = httpProxy.createProxy({
-		agent: targetProto == "https" ? proxyHttpsAgent : proxyHttpAgent,
-		target: `${targetProto}://${targetHost}:${targetPort}${!!req.headers["x-connect-uri"] ? req.headers["x-connect-uri"] : ""}`,
-		ws: true,
-		xfwd: true,
-		changeOrigin: false,
-		ignorePath: !!req.headers["x-connect-uri"],
-		followRedirects: false
-	});
-	proxy.on("proxyReq", proxyReq => {
-		if(res.destroyed) {
-			proxyReq.destroy();
-			res.destroy();
-			return;
+	console.log(`[REQUEST]: ${requestIp}: (${requestProtocol}) ${targetProto}//${targetHostname}:${targetPort}${targetUri}`);
+	const setupHeaders = headers => {
+		headers["host"] = targetHostname;
+		headers["x-real-ip"] = requestIp;
+		headers["x-forwarded-for"] = requestIp;
+		headers["x-forwarded-proto"] = requestProtocol;
+		delete headers["x-connect-token"];
+		delete headers["x-connect-host"];
+		delete headers["x-connect-port"];
+		delete headers["x-connect-hostname"];
+		delete headers["x-connect-proto"];
+		delete headers["x-trumpet-modifiers"];
+		delete headers["x-forwarded-host"];
+		delete headers["cdn-loop"];
+		delete headers["cf-connecting-ip"];
+		delete headers["cf-ipcountry"];
+		delete headers["cf-ray"];
+		delete headers["cf-visitor"];
+		delete headers["cf-warp-tag-id"];
+	};
+	try {
+		if(upgradeHead) {
+			await http2Proxy.ws(req, res, upgradeHead, {
+				hostname: targetHost,
+				port: targetPort,
+				path: targetUri,
+				onReq: (req, ureq) => {
+					ureq.agent = targetProto == "https:" ? proxyHttpsAgent : proxyHttpAgent;
+					setupHeaders(ureq.headers);
+				}
+			});
+		} else {
+			await http2Proxy.web(req, res, {
+				hostname: targetHost,
+				port: targetPort,
+				path: targetUri,
+				onReq: (req, ureq) => {
+					ureq.agent = targetProto == "https:" ? proxyHttpsAgent : proxyHttpAgent;
+					setupHeaders(ureq.headers);
+				}
+			});
 		}
-		const cleanup = (err) => {
-			res.removeListener("error", cleanup);
-			res.removeListener("close", cleanup);
-			proxyReq.destroy(err);
-			res.destroy(err);
-		};
-		res.addListener("error", cleanup);
-		res.addListener("close", cleanup);
-		proxyReq.setHeader("host", targetHostname);
-		proxyReq.setHeader("x-real-ip", requestIp);
-		proxyReq.setHeader("x-forwarded-for", requestIp);
-		proxyReq.setHeader("x-forwarded-proto", requestProtocol);
-		proxyReq.removeHeader("x-connect-token");
-		proxyReq.removeHeader("x-connect-host");
-		proxyReq.removeHeader("x-connect-port");
-		proxyReq.removeHeader("x-connect-hostname");
-		proxyReq.removeHeader("x-connect-proto");
-		proxyReq.removeHeader("x-trumpet-modifiers");
-		proxyReq.removeHeader("x-forwarded-host");
-		proxyReq.removeHeader("cdn-loop");
-		proxyReq.removeHeader("cf-connecting-ip");
-		proxyReq.removeHeader("cf-ipcountry");
-		proxyReq.removeHeader("cf-ray");
-		proxyReq.removeHeader("cf-visitor");
-		proxyReq.removeHeader("cf-warp-tag-id");
-		proxyReq.once("close", () => promiseResolvers.resolve(true));
-	});
-	proxy.on("proxyReqWs", proxyReq => {
-		proxyReq.once("close", () => promiseResolvers.resolve(true));
-	});
-	proxy.on("proxyRes", proxyRes => {
-		if(proxyRes.destroyed || res.destroyed) {
-			proxyRes.destroy();
-			res.destroy();
-			return;
-		}
-		const cleanup = (err) => {
-			proxyRes.removeListener("error", cleanup);
-			proxyRes.removeListener("close", cleanup);
-			res.removeListener("error", cleanup);
-			res.removeListener("close", cleanup);
-			proxyRes.destroy(err);
-			req.destroy(err);
-		};
-		proxyRes.addListener("error", cleanup);
-		proxyRes.addListener("close", cleanup);
-		res.addListener("error", cleanup);
-		res.addListener("close", cleanup);
-	});
-	proxy.on("error", err => {
-		console.error(`[REQUEST]: ${requestIp}: (${requestProtocol}) Failed to proxy ${targetProto}://${targetHostname}:${targetPort}${targetUri}`, err.message);
-		if(err.code == "ETIMEDOUT" || err.message.includes("timeout")) {
-			promiseResolvers.reject(new HTTPError(504, "Gateway Timed Out"));
-			return;
-		}
+	} catch(error) {
+		console.error(`[REQUEST]: ${requestIp}: (${requestProtocol}) Failed to proxy ${targetProto}//${targetHostname}:${targetPort}${targetUri}`, error.message);
+		if(error?.name == "HttpError")
+			throw new HTTPError(error.statusCode, error.message);
+		if(error.code == "ETIMEDOUT" || error.message.includes("timeout"))
+			throw new HTTPError(504, "Gateway Timed Out");
 		if(["ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH", 
 			"ECONNRESET", "ECONNABORTED", "ENOTFOUND", "EPIPE", 
-			"ERR_HTTP_INVALID_HEADER", "HPE_INVALID_HEADER_TOKEN"].includes(err.code) || 
-			err.message.includes("Parse Error") || err.message.includes("socket hang up")) {
-			promiseResolvers.reject(new HTTPError(502, "Bad Gateway"));
-			return;
-		}
-		promiseResolvers.reject(new HTTPError(500, "Internal Server Error"));
-	});
-	if(upgradeHead)
-		proxy.proxyWebsocketRequest(req, res, upgradeHead);
-	else
-		proxy.proxyRequest(req, res, { buffer: reqBody });
-	return await promiseResolvers.promise;
+			"ERR_HTTP_INVALID_HEADER", "HPE_INVALID_HEADER_TOKEN"].includes(error.code) || 
+			error.message.includes("Parse Error") || error.message.includes("socket hang up"))
+			throw new HTTPError(502, "Bad Gateway");
+		throw new HTTPError(500, "Internal Server Error");
+	}
 }
 
 const throwResponseErrorIfPossible = (status, message, res) => {
@@ -663,10 +636,15 @@ if(cluster.isPrimary) {
 		cluster.fork();
 	cluster.on("exit", (worker, code, signal) => {
 		console.warn(`Worker ${worker.process.pid} died with code ${code}${signal != null ? ` ${signal}` : ""}`);
-		setTimeout(() => cluster.fork(), 1000 * 15);
+		setTimeout(() => cluster.fork(), 1000);
 	});
 } else {
-	const httpServer = http.createServer((req, res) => {
+	const httpServer = http.createServer({
+		keepAlive: true,
+		keepAliveTimeout: 30 * 1000,
+		noDelay: true
+	});
+	httpServer.on("request", (req, res) => {
 		proxyRequest(req, res).catch(e => {
 			if(e instanceof HTTPError) {
 				throwResponseErrorIfPossible(e.httpCode, e.message, res);
@@ -675,9 +653,6 @@ if(cluster.isPrimary) {
 			throwResponseErrorIfPossible(500, "Internal Server Error", res);
 			throw e;
 		});
-	});
-	httpServer.listen(PORT, () => {
-		console.log(`HTTP Server listening to 0.0.0.0:${PORT}`);
 	});
 	httpServer.on("upgrade", (req, socket, head) => {
 		proxyRequest(req, socket, head).catch(e => {
@@ -688,5 +663,8 @@ if(cluster.isPrimary) {
 			throwSocketErrorIfPossible(500, "Internal Server Error", socket);
 			throw e;
 		});
+	});
+	httpServer.listen(PORT, () => {
+		console.log(`HTTP Server listening to 0.0.0.0:${PORT}`);
 	});
 }
