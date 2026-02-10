@@ -1,5 +1,7 @@
 import url from "url";
 import path from "path";
+import fs0 from "fs";
+import fs from "fs/promises";
 import http from "http";
 import https from "https";
 import cluster from "cluster";
@@ -24,6 +26,25 @@ const proxyHttpsAgent = new https.Agent({
 	keepAliveMsecs: 30 * 1000,
 	noDelay: true
 });
+
+const configFile = (process.env.HTTP_FORWARDER_CONFIG_FILE ?? "").length > 0 ? 
+	path.resolve(process.env.HTTP_FORWARDER_CONFIG_FILE) : null;
+const defaultConfig = Object.freeze({ hosts: {} });
+const readConfigFile = async () => {
+	if(configFile == null) return defaultConfig;
+	if(!fs0.existsSync(configFile)) {
+		console.warn(`Config file ${configFile} not found`);
+		return defaultConfig;
+	}
+	console.log(`Reading config from file ${configFile}`);
+	try { return JSON.parse(await fs.readFile(configFile, "utf-8")); }
+	catch(error) { console.error(error); return defaultConfig; }
+}
+let config = await readConfigFile();
+(async () => {
+	const watcher = fs.watch(configFile, { persistent: false });
+	for await(const _ of watcher) config = await readConfigFile();
+})();
 
 function regexReplace(regex, string, replacer) {
 	let lastIndex = 0;
@@ -535,29 +556,40 @@ function getTrumpetModifiers(modifiers, { requestProtocol }) {
 
 const normalizeProtocol = protocol => protocol.endsWith(":") ? protocol : `${protocol}:`;
 async function proxyRequest(req, res, upgradeHead) {
-	if(req.headers["x-connect-token"] != process.env.HTTP_FORWARDER_CONNECT_TOKEN)
-		throw new HTTPError(400, "Bad token");
 	const requestProtocol = normalizeProtocol((req.headers["x-forwarded-proto"] || req.protocol).split(",").map(l => l.trim()).at(-1));
 	const requestIp = (req.headers["x-forwarded-for"] || req.socket.remoteAddress).split(",").map(l => l.trim()).at(-1);
-	const targetProto = normalizeProtocol(req.headers["x-connect-proto"] || "http:");
-	const targetHost = req.headers["x-connect-host"];
-	const targetPort = req.headers["x-connect-port"];
-	const targetHostname = req.headers["x-connect-hostname"] || targetHost;
-	const targetUri = req.headers["x-connect-uri"] || req.uri || "/";
-	if(!["https:", "http:"].includes(targetProto))
-		throw new HTTPError(400, "Invalid connect headers.");
-	let trumpetModifiers = null;
-	if(req.headers["x-trumpet-modifiers"]) {
+	let targetProto = null;
+	let targetHost = null;
+	let targetPort = null;
+	let targetHostname = null;
+	let targetUri = null;
+	let trumpetModifiersConfig = null;
+	if(req.headers["host"]?.toLowerCase() in config.hosts) {
+		const config = config.hosts[req.headers["host"].toLowerCase()];
+		targetProto = normalizeProtocol(config.proto || "http:");
+		targetHost = config.host;
+		targetPort = config.port;
+		targetHostname = config.hostname || targetHost;
+		targetUri = config.uri || req.uri || "/";
+		trumpetModifiersConfig = config.trumpetModifiers;
+	} else {
+		if(req.headers["x-connect-token"] != process.env.HTTP_FORWARDER_CONNECT_TOKEN)
+			throw new HTTPError(400, "Bad token");
+		targetProto = normalizeProtocol(req.headers["x-connect-proto"] || "http:");
+		targetHost = req.headers["x-connect-host"];
+		targetPort = req.headers["x-connect-port"];
+		targetHostname = req.headers["x-connect-hostname"] || targetHost;
+		targetUri = req.headers["x-connect-uri"] || req.uri || "/";
 		try {
-			const trumpetModifiersConfig = JSON.parse(req.headers["x-trumpet-modifiers"]);
-			if(trumpetModifiersConfig.length > 0)
-				trumpetModifiers = getTrumpetModifiers(trumpetModifiersConfig, { requestProtocol });
+			trumpetModifiersConfig = JSON.parse(req.headers["x-trumpet-modifiers"]);
 		} catch(e) {
 			throw new HTTPError(400, `Invalid trumpet modifiers, ${e.message}`);
 		}
 	}
-	if(trumpetModifiers != null)
-		trumpetModifiers(req, res);
+	if(!["https:", "http:"].includes(targetProto) || targetHost == null || targetPort == null || targetHostname == null || targetUri == null)
+		throw new HTTPError(400, "Invalid connect headers.");
+	if(trumpetModifiersConfig != null && trumpetModifiersConfig.length > 0)
+		getTrumpetModifiers(trumpetModifiersConfig, { requestProtocol })(req, res);
 	console.log(`[REQUEST]: ${requestIp}: (${requestProtocol}) ${targetProto}//${targetHostname}:${targetPort}${targetUri}`);
 	const setupHeaders = headers => {
 		headers["host"] = targetHostname;
