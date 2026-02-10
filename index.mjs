@@ -565,21 +565,21 @@ async function proxyRequest(req, res, upgradeHead) {
 	let targetUri = null;
 	let trumpetModifiersConfig = null;
 	if(req.headers["host"]?.toLowerCase() in config.hosts) {
-		const config = config.hosts[req.headers["host"].toLowerCase()];
-		targetProto = normalizeProtocol(config.proto || "http:");
-		targetHost = config.host;
-		targetPort = config.port;
-		targetHostname = config.hostname || targetHost;
-		targetUri = config.uri || req.uri || "/";
-		trumpetModifiersConfig = config.trumpetModifiers;
+		const hostConfig = config.hosts[req.headers["host"].toLowerCase()];
+		targetProto = normalizeProtocol(hostConfig.proto || requestProtocol || "http:");
+		targetHost = hostConfig.host;
+		targetPort = (targetProto == "https:" ? hostConfig.portHttps : hostConfig.portHttp) || hostConfig.port;
+		targetHostname = hostConfig.hostname || targetHost;
+		targetUri = hostConfig.uri || req.uri || req.url || "/";
+		trumpetModifiersConfig = hostConfig.trumpetModifiers;
 	} else {
 		if(req.headers["x-connect-token"] != process.env.HTTP_FORWARDER_CONNECT_TOKEN)
 			throw new HTTPError(400, "Bad token");
-		targetProto = normalizeProtocol(req.headers["x-connect-proto"] || "http:");
+		targetProto = normalizeProtocol(req.headers["x-connect-proto"] || requestProtocol || "http:");
 		targetHost = req.headers["x-connect-host"];
-		targetPort = req.headers["x-connect-port"];
+		targetPort = (targetProto == "https:" ? req.headers["x-connect-port-https"] : req.headers["x-connect-port-http"]) || req.headers["x-connect-port"];
 		targetHostname = req.headers["x-connect-hostname"] || targetHost;
-		targetUri = req.headers["x-connect-uri"] || req.uri || "/";
+		targetUri = req.headers["x-connect-uri"] || req.uri || req.url || "/";
 		try {
 			trumpetModifiersConfig = JSON.parse(req.headers["x-trumpet-modifiers"]);
 		} catch(e) {
@@ -597,22 +597,25 @@ async function proxyRequest(req, res, upgradeHead) {
 		headers["x-forwarded-for"] = requestIp;
 		headers["x-forwarded-proto"] = requestProtocol;
 		delete headers["x-connect-token"];
+		delete headers["x-connect-proto"];
 		delete headers["x-connect-host"];
 		delete headers["x-connect-port"];
+		delete headers["x-connect-port-http"];
+		delete headers["x-connect-port-https"];
 		delete headers["x-connect-hostname"];
-		delete headers["x-connect-proto"];
+		delete headers["x-connect-uri"];
 		delete headers["x-trumpet-modifiers"];
 		delete headers["x-forwarded-host"];
 		delete headers["cdn-loop"];
-		delete headers["cf-connecting-ip"];
-		delete headers["cf-ipcountry"];
-		delete headers["cf-ray"];
-		delete headers["cf-visitor"];
-		delete headers["cf-warp-tag-id"];
+		for(const key in headers) {
+			if(!key.startsWith("cf-")) continue;
+			delete headers[key];
+		}
 	};
 	try {
 		if(upgradeHead) {
 			await http2Proxy.ws(req, res, upgradeHead, {
+				protocol: targetProto,
 				hostname: targetHost,
 				port: targetPort,
 				path: targetUri,
@@ -623,6 +626,7 @@ async function proxyRequest(req, res, upgradeHead) {
 			});
 		} else {
 			await http2Proxy.web(req, res, {
+				protocol: targetProto,
 				hostname: targetHost,
 				port: targetPort,
 				path: targetUri,
