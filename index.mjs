@@ -581,7 +581,7 @@ async function proxyRequest(req, res, upgradeHead) {
 		targetHostname = req.headers["x-connect-hostname"] || targetHost;
 		targetUri = req.headers["x-connect-uri"] || req.uri || req.url || "/";
 		try {
-			trumpetModifiersConfig = JSON.parse(req.headers["x-trumpet-modifiers"]);
+			trumpetModifiersConfig = !!req.headers["x-trumpet-modifiers"] ? JSON.parse(req.headers["x-trumpet-modifiers"]) : null;
 		} catch(e) {
 			throw new HTTPError(400, `Invalid trumpet modifiers, ${e.message}`);
 		}
